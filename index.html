@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Arena Blasters — Web (ONNX)</title>
+<!-- onnxruntime-web CDN -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<style>
+  :root{
+    --bg:#F0F4F8;--ink:#222831;--muted:#A0AEC0;
+    --mint:#4ECDC4;--coral:#FF6B6B;
+    --solid:#C8CED8;--thin:#B8C0CC;--laser:#FF8F6B;
+  }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  .wrap{height:100%;display:grid;place-items:center}
+  #game{box-shadow:0 20px 60px rgba(0,0,0,.12);border-radius:18px;background:transparent}
+  .hud{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+  .loader{display:flex;gap:12px;align-items:center;justify-content:center;background:rgba(255,255,255,.6);backdrop-filter:blur(6px);border-radius:16px;padding:14px 18px;box-shadow:0 10px 30px rgba(0,0,0,.08);font-weight:600}
+  .dot{width:8px;height:8px;background:var(--coral);border-radius:50%;animation:bounce 1s infinite}
+  .dot:nth-child(2){animation-delay:.12s;background:var(--mint)}
+  .dot:nth-child(3){animation-delay:.24s;background:#00ADB5}
+  @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-8px)}}
+  .tip{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);color:#5b6471;font-size:12px;opacity:.8}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="game" width="960" height="600"></canvas>
+  <div class="hud" id="hud">
+    <div class="loader" id="loading"><span>모델 로딩 중</span>
+      <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+    </div>
+  </div>
+  <div class="tip">ONNX inference: argmax(logits) → Discrete action • Click canvas to focus (←/→/Space/Shift for human debug override)</div>
+</div>
+
+<script>
+/* ============================================================
+   Observation Space Structure (27) — EXACT order (Python parity)
+   ------------------------------------------------------------
+   [ you_x, you_y, you_vx, you_vy, you_on_ground,
+     you_hp, you_has_gun, you_ammo,
+     gun_onehot(Pistol,SMG,Shotgun,Rifle,Sniper,Rocket,Laser) ← 7 slots,
+     enemy_x, enemy_y, enemy_vx, enemy_vy, enemy_hp,
+     rel_dx, rel_dy,
+     nearest_gun_dx, nearest_gun_dy, nearest_gun_exists,
+     threat_dist, time_left ]
+   - All values already normalized in [-1, 1] using the same rules as Python env:
+     * _norm_pos: ((clamp(x,0,W)/W)*2 - 1)
+     * _norm_val: clamp(v/vmax, -1, 1)
+     * you_on_ground: 1 if true else -1
+     * hp: (hp/100)*2 - 1
+     * has_gun: 1 / -1
+     * ammo: (min(40, ammo)/40)*2 - 1
+     * gun_onehot: +1 for held type else -1
+     * threat: safe = clamp(threat_distance/Dcap,0,1); threat = safe*2 - 1 (Dcap=800)
+     * tleft: (time_left/150)*2 - 1
+   Action Space (Discrete 12) — EXACT mapping:
+   0: idle, 1: left, 2: right, 3: jump, 4: attack, 5: pickup/throw,
+   6: dash, 7: left+attack, 8: right+attack, 9: jump+attack,
+   10: approach gun, 11: approach+pickup
+   ============================================================ */
+
+/* ------------------ Core constants (match Python) ------------------ */
+const WORLD_W = 1920;  // Python scene RW
+const WORLD_H = 1200;  // Python scene RH
+const VIEW_W  = 960;   // canvas size
+const VIEW_H  = 600;
+const SCALE   = VIEW_W / WORLD_W;
+
+const GRAVITY = 2200;
+const MAX_FALL= 2400;
+const MOVE_ACC= 4200;       // stronger accel for snappy stop
+const MAX_VX  = 600;
+const JUMP_VY = -980;
+const DASH_VX = 900;
+const DASH_DUR= 0.13;
+const DASH_CD = 0.60;
+
+const DT      = 1/60;
+const D_THREAT_CAP = 800;
+
+/* ------------------ Minimalist arena geometry ------------------ */
+const SOLID = 0, THIN = 1;
+const platforms = [
+  // floor (solid, thick)
+  {x: WORLD_W*0.05, y: WORLD_H*0.86, w: WORLD_W*0.90, h: 30, t: SOLID},
+  // mid solid block (center)
+  {x: WORLD_W*0.35, y: WORLD_H*0.60, w: WORLD_W*0.30, h: 24, t: SOLID},
+  // upper thin ledges
+  {x: WORLD_W*0.18, y: WORLD_H*0.46, w: WORLD_W*0.28, h: 18, t: THIN},
+  {x: WORLD_W*0.54, y: WORLD_H*0.36, w: WORLD_W*0.28, h: 18, t: THIN},
+];
+
+function rrect(ctx, x,y,w,h,r=12, col="#C8CED8"){ctx.fillStyle=col;roundedRect(ctx,x,y,w,h,r);ctx.fill();}
+function roundedRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function drawCircle(ctx, x,y,r, col){ctx.fillStyle=col;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();}
+
+/* ------------------ Entities ------------------ */
+class Player{
+  constructor(x,y,color,name){
+    this.x=x;this.y=y;this.vx=0;this.vy=0;this.w=36;this.h=54;
+    this.onGround=false;this.face=1;this.color=color;this.name=name||"YOU";
+    this.hp=100;this.alive=true;
+    this.holding=null;   // {name,color,ammo,special}
+    this.attackCD=0;
+    this.dashT=0;this.dashCD=0;
+  }
+}
+class Gun{
+  constructor(name,color,dmg,cool,spd,recoil,ammo,special=""){
+    this.name=name;this.color=color;this.dmg=dmg;this.cool=cool;this.spd=spd;this.recoil=recoil;this.ammo=ammo;this.special=special;
+    // world placement
+    this.x=0;this.y=0;this.state="ground"; // "ground" or "equipped"
+  }
+}
+const GUNS = [
+  new Gun("Pistol","#3FA7D6",16,0.26,980,70,14),
+  new Gun("SMG"   ,"#2BB673",10,0.12,920,55,28,"burst3"),
+  new Gun("Shotgun","#9C27B0",8 ,0.55,820,140,8 ,"spread"),
+  new Gun("Rifle" ,"#00ADB5",20,0.30,1100,90,16),
+  new Gun("Sniper","#FF8F6B",45,0.80,1600,220,6 ,"sniper"),
+  new Gun("Rocket","#FD5E53",60,0.90,700 ,260,5 ,"rocket"),
+  new Gun("Laser" ,"#FF8F6B",2 ,0.05,0  ,  0,120,"laser"), // laser: DPS tick beam
+];
+
+class Bullet{
+  constructor(x,y,vx,vy,dmg,owner,life=0.9,rad=6,explosive=false){
+    this.x=x;this.y=y;this.vx=vx;this.vy=vy;this.dmg=dmg;this.owner=owner;
+    this.life=life;this.age=0;this.r=rad;this.explosive=explosive;
+  }
+}
+class Beam{ // laser beam snapshot for threat/visual
+  constructor(sx,sy,ex,ey,owner,dur=0.06){
+    this.sx=sx;this.sy=sy;this.ex=ex;this.ey=ey;this.owner=owner;this.t=dur;
+  }
+}
+
+/* ------------------ Game State ------------------ */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+ctx.imageSmoothingEnabled = true;
+
+const HUD = document.getElementById('hud');
+const loading = document.getElementById('loading');
+
+const YOU   = new Player(WORLD_W*0.25,WORLD_H*0.2,"var(--mint)","YOU");
+const ENEMY = new Player(WORLD_W*0.75,WORLD_H*0.2,"var(--coral)","ENEMY");
+let bullets = [];
+let beams   = [];
+let groundGuns = [];
+
+let timeLeft = 120; // seconds
+
+/* ------------------ Helpers (Parity with Python) ------------------ */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const normPos = (x,W)=> ((clamp(x,0,W)/W)*2-1);
+const normVal = (v,vm)=> clamp(v/vm,-1,1);
+
+function aabb(px,py,w,h){return {x:px-w/2,y:py-h,w:w,h:h}}
+function rectInter(a,b){return !(a.x+a.w<=b.x || a.x>=b.x+b.w || a.y+a.h<=b.y || a.y>=b.y+b.h);}
+
+function spawnGunAt(x,y){
+  const base = GUNS[Math.floor(Math.random()*GUNS.length)];
+  const g = new Gun(base.name,base.color,base.dmg,base.cool,base.spd,base.recoil,Math.max(1,base.ammo+((Math.random()*5|0)-2)),base.special);
+  g.x=x;g.y=y;g.state="ground";groundGuns.push(g);
+}
+(function seedGuns(){
+  // spawn atop each platform and random floor spread
+  for(const p of platforms){
+    const n = (p.t===THIN?1:2);
+    for(let i=0;i<n;i++){
+      const gx = p.x + (i+1)*(p.w/(n+1));
+      const gy = p.y - 24;
+      spawnGunAt(gx,gy);
+    }
+  }
+  // floor scattering
+  for(let i=0;i<6;i++){
+    const fx = WORLD_W*0.1 + Math.random()*WORLD_W*0.8;
+    const fy = platforms[0].y - 24;
+    spawnGunAt(fx,fy);
+  }
+})();
+
+/* ------------------ Physics & Controls ------------------ */
+let keys = Object.create(null);
+window.addEventListener('keydown',e=>{keys[e.code]=true;});
+window.addEventListener('keyup',e=>{keys[e.code]=false;});
+
+function controlFromAction(pl, other, a){
+  // returns {left,right,jump,attack,pick,dash}
+  let left=false,right=false,jump=false,attack=false,pick=false,dash=false;
+  if(a===1) left=true;
+  else if(a===2) right=true;
+  else if(a===3) jump=true;
+  else if(a===4) attack=true;
+  else if(a===5) pick=true;
+  else if(a===6) dash=true;
+  else if(a===7){left=true;attack=true;}
+  else if(a===8){right=true;attack=true;}
+  else if(a===9){jump=true;attack=true;}
+  else if(a===10){
+    const ng = nearestGroundGun(pl);
+    if(ng.found){left = (ng.dx<0); right = !left;}
+    else {left = (other.x<pl.x); right = !left;}
+  } else if(a===11){
+    const ng = nearestGroundGun(pl);
+    if(ng.found){
+      left = (ng.dx<0); right = !left;
+      if(Math.hypot(ng.dx,ng.dy)<60) pick=true;
+    }
+  }
+  // optional human override (for debugging): arrow/WASD/Space/Shift
+  if(keys.ArrowLeft||keys.KeyA) left=true;
+  if(keys.ArrowRight||keys.KeyD) right=true;
+  if(keys.Space||keys.KeyW) jump=true;
+  if(keys.KeyJ||keys.MouseLeft) attack=true; // (Mouse mapped later if needed)
+  if(keys.KeyK||keys.MouseRight) pick=true;
+  if(keys.ShiftLeft||keys.ShiftRight) dash=true;
+  return {left,right,jump,attack,pick,dash};
+}
+
+function collideAndMove(pl){
+  // X
+  pl.x += pl.vx*DT;
+  let r = aabb(pl.x,pl.y,pl.w,pl.h);
+  for(const p of platforms){
+    if(p.t===THIN) continue;
+    const pr = {x:p.x,y:p.y,w:p.w,h:p.h};
+    if(rectInter(r,pr)){
+      if(pl.vx>0) pl.x = p.x - pl.w/2;
+      else if(pl.vx<0) pl.x = p.x + p.w + pl.w/2;
+      pl.vx=0; r = aabb(pl.x,pl.y,pl.w,pl.h);
+    }
+  }
+  // Y
+  pl.onGround=false;
+  pl.y += pl.vy*DT;
+  r = aabb(pl.x,pl.y,pl.w,pl.h);
+  for(const p of platforms){
+    const pr = {x:p.x,y:p.y,w:p.w,h:p.h};
+    if(p.t===THIN){
+      // collide from above only, allow jump-through
+      if(pl.vy>=0 && r.y+r.h>p.y && (r.y - pl.vy*DT) + r.h <= p.y + 2 && r.x+r.w>p.x && r.x<p.x+p.w){
+        pl.y = p.y; pl.vy=0; pl.onGround=true; r=aabb(pl.x,pl.y,pl.w,pl.h);
+      }
+    }else{
+      if(rectInter(r,pr)){
+        if(pl.vy>0){pl.y=p.y;pl.onGround=true;}
+        else pl.y=p.y+p.h+pl.h;
+        pl.vy=0; r=aabb(pl.x,pl.y,pl.w,pl.h);
+      }
+    }
+  }
+  // bounds
+  pl.y = Math.min(pl.y, WORLD_H+200);
+}
+
+function nearestGroundGun(pl){
+  let best=Infinity, gx=0,gy=0, found=false, idx=-1;
+  for(let i=0;i<groundGuns.length;i++){
+    const g=groundGuns[i];
+    if(g.state!=="ground") continue;
+    const dx=g.x-pl.x, dy=g.y-(pl.y-pl.h);
+    const d2=dx*dx+dy*dy;
+    if(d2<best){best=d2;gx=dx;gy=dy;found=true;idx=i;}
+  }
+  return {dx:gx,dy:gy,found,dist:found?Math.sqrt(best):1e9,index:idx};
+}
+
+function pickup(pl){
+  if(pl.holding) return false;
+  for(let i=0;i<groundGuns.length;i++){
+    const g=groundGuns[i]; if(g.state!=="ground") continue;
+    if(Math.abs(g.x-pl.x)<56 && Math.abs(g.y-(pl.y-pl.h))<84){
+      pl.holding = g; g.state="equipped"; groundGuns.splice(i,1);
+      return true;
+    }
+  }
+  return false;
+}
+
+function fire(pl, other){
+  if(!pl.holding || pl.attackCD>0) return;
+  const g=pl.holding;
+  // aim at enemy chest
+  const ang = Math.atan2((other.y - other.h*0.6) - (pl.y - pl.h*0.6), other.x - pl.x);
+  const c=Math.cos(ang), s=Math.sin(ang);
+  const px = pl.x + c*20, py = (pl.y - pl.h*0.6) + s*20;
+
+  let shots=0;
+  function shot(spread=0, speed=g.spd, dmg=g.dmg, life=0.9, rad=6, explosive=false){
+    const a = ang + spread;
+    bullets.push(new Bullet(px,py, Math.cos(a)*speed, Math.sin(a)*speed, dmg, pl, life, rad, explosive));
+    shots++;
+  }
+
+  if(g.special==="spread"){
+    for(let i=0;i<6;i++){
+      const offs = (Math.random()*18-9)*(Math.PI/180);
+      shot(offs,g.spd*0.9,g.dmg,0.6,5,false);
+    }
+  }else if(g.special==="burst3"){
+    for(let i=0;i<3;i++){
+      const offs = (Math.random()*8-4)*(Math.PI/180);
+      shot(offs,g.spd*0.95,g.dmg,0.6,5,false);
+    }
+  }else if(g.special==="sniper"){
+    shot(0,g.spd,g.dmg,1.1,6,false);
+  }else if(g.special==="rocket"){
+    shot(0,g.spd,g.dmg,1.2,7,true);
+  }else if(g.special==="laser"){
+    // wide beam (no travel), applies DPS; also contributes to threat distance
+    const lx = px + c*900, ly = py + s*900;
+    beams.push(new Beam(px,py,lx,ly,pl,0.06));
+    // damage if line is close to other
+    const d = pointSegmentDistance(other.x, other.y-other.h*0.5, px,py,lx,ly);
+    if(d<24){ other.hp = Math.max(0, other.hp - 6); if(other.hp===0) other.alive=false;}
+    shots=1;
+  }else{
+    shot();
+  }
+
+  g.ammo -= shots;
+  if(g.ammo<=0){ pl.holding=null; }
+  pl.attackCD = g.cool;
+}
+
+function updateBullets(){
+  for(let i=bullets.length-1;i>=0;i--){
+    const b=bullets[i];
+    b.age+=DT; b.x+=b.vx*DT; b.y+=b.vy*DT;
+    const r = {x:b.x-b.r,y:b.y-b.r,w:b.r*2,h:b.r*2};
+    // collide with solid & thin from above
+    let hit=false;
+    for(const p of platforms){
+      const pr={x:p.x,y:p.y,w:p.w,h:p.h};
+      if(p.t===THIN){
+        if(b.vy>0 && r.y+r.h>p.y && r.y<p.y && r.x+r.w>p.x && r.x<p.x+p.w){hit=true;break;}
+      }else{
+        if(rectInter(r,pr)){hit=true;break;}
+      }
+    }
+    const targets=[YOU,ENEMY];
+    for(const pl of targets){
+      if(b.owner===pl || !pl.alive) continue;
+      const pr=aabb(pl.x,pl.y,pl.w,pl.h);
+      if(rectInter(r,pr)){
+        pl.hp=Math.max(0,pl.hp-b.dmg);
+        if(pl.hp===0) pl.alive=false;
+        hit=true;break;
+      }
+    }
+    if(hit || b.age>b.life){ bullets.splice(i,1); continue; }
+  }
+  // beams decay
+  for(let i=beams.length-1;i>=0;i--){
+    beams[i].t -= DT; if(beams[i].t<=0) beams.splice(i,1);
+  }
+}
+
+function pointSegmentDistance(px,py,ax,ay,bx,by){
+  const abx=bx-ax, aby=by-ay, apx=px-ax, apy=py-ay;
+  const ab2=abx*abx+aby*aby || 1e-6;
+  let t=(apx*abx+apy*aby)/ab2; t= Math.max(0,Math.min(1,t));
+  const cx=ax+abx*t, cy=ay+aby*t;
+  return Math.hypot(px-cx,py-cy);
+}
+
+function threatDistance(me){
+  let best=Infinity;
+  for(const b of bullets){
+    if(b.owner===me) continue;
+    best = Math.min(best, Math.hypot(me.x-b.x, (me.y-me.h*0.5)-b.y));
+  }
+  for(const bm of beams){
+    if(bm.owner===me) continue;
+    best = Math.min(best, pointSegmentDistance(me.x,me.y-me.h*0.5, bm.sx,bm.sy,bm.ex,bm.ey));
+  }
+  return isFinite(best)? best : Math.max(WORLD_W,WORLD_H);
+}
+
+/* ------------------ Rendering ------------------ */
+function worldToScreenX(x){return (x)*SCALE;}
+function worldToScreenY(y){return (y)*SCALE;}
+
+function drawPlayer(p){
+  const x=worldToScreenX(p.x-p.w/2), y=worldToScreenY(p.y-p.h),
+        w=p.w*SCALE, h=p.h*SCALE;
+  ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue(p.color.match(/^var/)?p.color.replace(/[()]/g,''):'--ink')||p.color;
+  ctx.beginPath(); roundedRect(ctx,x,y,w,h,12*SCALE); ctx.fill();
+
+  // visor
+  ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--bg');
+  rrect(ctx,x+6*SCALE,y+10*SCALE,w-12*SCALE,8*SCALE,6*SCALE,getComputedStyle(document.documentElement).getPropertyValue('--bg'));
+
+  // gun icon in hand
+  if(p.holding){
+    const col=p.holding.color;
+    ctx.fillStyle=col;
+    const gx=worldToScreenX(p.x + p.face*14) , gy=worldToScreenY(p.y - p.h*0.65);
+    ctx.save(); ctx.translate(gx,gy);
+    // draw tiny body + barrel
+    ctx.fillStyle=col; roundedRect(ctx,-13*SCALE,-6*SCALE,26*SCALE,12*SCALE,4*SCALE); ctx.fill();
+    ctx.fillStyle="#222831"; roundedRect(ctx,10*SCALE,-2*SCALE,10*SCALE,4*SCALE,2*SCALE); ctx.fill();
+    ctx.restore();
+  }
+
+  // HP bar
+  const hpw = w * Math.max(0,Math.min(1,p.hp/100));
+  rrect(ctx,x,y-10*SCALE,w,6*SCALE,3*SCALE,"#A0AEC0");
+  rrect(ctx,x,y-10*SCALE,hpw,6*SCALE,3*SCALE,(p.hp>35)?"#4ECDC4":"#FF6B6B");
+}
+
+function drawLevel(){
+  for(const p of platforms){
+    const col = p.t===THIN? getComputedStyle(document.documentElement).getPropertyValue('--thin')
+                           : getComputedStyle(document.documentElement).getPropertyValue('--solid');
+    rrect(ctx, worldToScreenX(p.x), worldToScreenY(p.y), p.w*SCALE, p.h*SCALE, 12*SCALE, col);
+  }
+}
+
+function drawGuns(){
+  for(const g of groundGuns){
+    drawCircle(ctx, worldToScreenX(g.x), worldToScreenY(g.y), 16*SCALE, g.color);
+    // ring
+    ctx.fillStyle = "rgba(255,255,255,.6)";
+  }
+}
+
+function drawBullets(){
+  ctx.fillStyle="#222831";
+  for(const b of bullets){
+    drawCircle(ctx, worldToScreenX(b.x), worldToScreenY(b.y), b.r*SCALE, "#222831");
+  }
+  // beams
+  for(const bm of beams){
+    ctx.strokeStyle="rgba(255,143,107,.85)";
+    ctx.lineWidth = 8*SCALE;
+    ctx.lineCap="round";
+    ctx.beginPath();
+    ctx.moveTo(worldToScreenX(bm.sx), worldToScreenY(bm.sy));
+    ctx.lineTo(worldToScreenX(bm.ex), worldToScreenY(bm.ey));
+    ctx.stroke();
+  }
+}
+
+function drawHUD(){
+  ctx.fillStyle="#222831";
+  ctx.font = "16px Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+  ctx.textAlign="center";
+  const m = Math.floor(timeLeft/60), s = Math.floor(timeLeft%60);
+  ctx.fillText(`${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`, VIEW_W/2, 24);
+  ctx.textAlign="left";
+  const gunTxt = YOU.holding? `${YOU.holding.name} [${YOU.holding.ammo}]` : "None";
+  ctx.fillText(gunTxt, 14, 24);
+}
+
+/* ------------------ Observation construction (27) ------------------ */
+const GUN_NAMES = ["Pistol","SMG","Shotgun","Rifle","Sniper","Rocket","Laser"];
+function obsFor(pl, other){
+  const you_x = normPos(pl.x, WORLD_W);
+  const you_y = normPos(pl.y, WORLD_H);
+  const you_vx= normVal(clamp(pl.vx,-MAX_VX,MAX_VX), MAX_VX);
+  const you_vy= normVal(clamp(pl.vy,-MAX_FALL,MAX_FALL), MAX_FALL);
+  const you_on= pl.onGround? 1:-1;
+  const you_hp= (pl.hp/100)*2 - 1;
+  const has_gun = pl.holding?1:-1;
+  const ammo = pl.holding? ((Math.min(40,pl.holding.ammo)/40)*2 -1) : -1;
+
+  const onehot = new Array(7).fill(-1);
+  if(pl.holding){
+    const idx = GUN_NAMES.indexOf(pl.holding.name);
+    if(idx>=0) onehot[idx]=1;
+  }
+
+  const en_x = normPos(other.x, WORLD_W);
+  const en_y = normPos(other.y, WORLD_H);
+  const en_vx= normVal(clamp(other.vx,-MAX_VX,MAX_VX), MAX_VX);
+  const en_vy= normVal(clamp(other.vy,-MAX_FALL,MAX_FALL), MAX_FALL);
+  const en_hp= (other.hp/100)*2 - 1;
+
+  const rel_dx = normVal(other.x - pl.x, WORLD_W);
+  const rel_dy = normVal(other.y - pl.y, WORLD_H);
+
+  const ng = nearestGroundGun(pl);
+  const ng_dx = normVal(ng.dx, WORLD_W);
+  const ng_dy = normVal(ng.dy, WORLD_H);
+  const ng_ok = ng.found?1:-1;
+
+  const d = clamp(threatDistance(pl)/D_THREAT_CAP, 0, 1);
+  const threat = d*2 - 1;
+
+  const tleft = (timeLeft/150)*2 - 1;
+
+  // Float32Array in EXACT order
+  const v = new Float32Array(27);
+  let i=0;
+  v[i++]=you_x; v[i++]=you_y; v[i++]=you_vx; v[i++]=you_vy; v[i++]=you_on;
+  v[i++]=you_hp; v[i++]=has_gun; v[i++]=ammo;
+  for(const k of onehot) v[i++]=k;
+  v[i++]=en_x; v[i++]=en_y; v[i++]=en_vx; v[i++]=en_vy; v[i++]=en_hp;
+  v[i++]=rel_dx; v[i++]=rel_dy; v[i++]=ng_dx; v[i++]=ng_dy; v[i++]=ng_ok;
+  v[i++]=threat; v[i++]=tleft;
+  return v;
+}
+
+/* ------------------ AI inference ------------------ */
+let session=null;
+let modelReady=false;
+
+async function loadModel(){
+  // prefer webgpu if available, fallback wasm
+  const providers = [];
+  if (ort.env.wasm.simd) providers.push("wasm");
+  // try webgpu if runtime supports
+  try{ if (navigator.gpu) providers.unshift("webgpu"); }catch(_){}
+  session = await ort.InferenceSession.create("model.onnx", {executionProviders: providers.length?providers:["wasm"]});
+  modelReady=true;
+  loading.style.display="none";
+}
+
+function argmax(arr){let m=-Infinity, idx=0; for(let i=0;i<arr.length;i++){if(arr[i]>m){m=arr[i];idx=i}} return idx;}
+
+/* ------------------ Main loop ------------------ */
+let last = performance.now();
+async function tick(now){
+  const dt = Math.min(0.033, (now-last)/1000) || DT; last=now;
+
+  // timers
+  YOU.attackCD = Math.max(0, YOU.attackCD - dt);
+  ENEMY.attackCD = Math.max(0, ENEMY.attackCD - dt);
+  YOU.dashCD = Math.max(0, YOU.dashCD - dt);
+  ENEMY.dashCD = Math.max(0, ENEMY.dashCD - dt);
+  if(YOU.dashT>0) YOU.dashT -= dt;
+  if(ENEMY.dashT>0) ENEMY.dashT -= dt;
+
+  // simple enemy: strafe + shoot sometimes
+  const desire = (YOU.x>ENEMY.x)?1:-1;
+  ENEMY.vx += desire*MOVE_ACC*dt;
+  if(Math.random()<0.02 && ENEMY.onGround) ENEMY.vy = JUMP_VY;
+  ENEMY.vx = clamp(ENEMY.vx, -MAX_VX, MAX_VX);
+
+  // model action
+  let ctrl = {left:false,right:false,jump:false,attack:false,pick:false,dash:false};
+  if(modelReady){
+    const obs = obsFor(YOU, ENEMY);
+    const feeds = { observation: new ort.Tensor('float32', obs, [1,27]) };
+    const out = await session.run(feeds);
+    const logits = out.action.data;
+    const action = argmax(logits);
+    ctrl = controlFromAction(YOU, ENEMY, action);
+  }
+
+  // apply control to YOU
+  if(YOU.dashCD<=0 && ctrl.dash){
+    YOU.vx = (ctrl.left && !ctrl.right)? -DASH_VX : (ctrl.right && !ctrl.left? DASH_VX : (ENEMY.x>YOU.x?DASH_VX:-DASH_VX));
+    YOU.vy *= 0.5; YOU.dashT = DASH_DUR; YOU.dashCD=DASH_CD;
+  }
+  const ax = (ctrl.left?-1:0) + (ctrl.right?1:0);
+  if(YOU.dashT<=0) YOU.vx += ax*MOVE_ACC*dt;
+  // no sliding on ground
+  if(YOU.onGround && ax===0 && YOU.dashT<=0) YOU.vx=0;
+  YOU.vx = clamp(YOU.vx, -MAX_VX, MAX_VX);
+  if(ctrl.jump && YOU.onGround) YOU.vy = JUMP_VY;
+
+  // pickup/attack
+  if(ctrl.pick) pickup(YOU);
+  if(ctrl.attack) fire(YOU, ENEMY);
+  // enemy auto-fire for pressure
+  if(Math.random()<0.12) fire(ENEMY, YOU);
+
+  // gravity
+  YOU.vy = clamp(YOU.vy + GRAVITY*dt, -Infinity, MAX_FALL);
+  ENEMY.vy = clamp(ENEMY.vy + GRAVITY*dt, -Infinity, MAX_FALL);
+
+  // integrate + collide
+  collideAndMove(YOU); collideAndMove(ENEMY);
+
+  // bullets/beams
+  updateBullets();
+
+  // time
+  timeLeft = Math.max(0, timeLeft - dt);
+
+  // --- render ---
+  ctx.clearRect(0,0,VIEW_W,VIEW_H);
+  drawLevel();
+  drawGuns();
+  drawBullets();
+  drawPlayer(YOU);
+  drawPlayer(ENEMY);
+  drawHUD();
+
+  requestAnimationFrame(tick);
+}
+
+/* ------------------ Boot ------------------ */
+requestAnimationFrame(()=>requestAnimationFrame(tick));
+loadModel().catch(err=>{
+  loading.innerHTML = "모델 로드 실패 😵<br>"+String(err);
+});
+
+canvas.addEventListener('click', ()=>canvas.focus());
+</script>
+</body>
+</html>

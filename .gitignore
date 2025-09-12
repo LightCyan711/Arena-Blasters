@@ -1,0 +1,9 @@
+/checkpoints
+/environment.py
+/export_onnx.py
+/final_model.zip
+/game.py
+/tensorboard_logs
+/test_model.py
+/train.py
+/__pycache__
