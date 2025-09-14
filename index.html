@@ -254,9 +254,9 @@ class Particle{
 class GunDef{constructor(name,color,dmg,cd,speed,recoil,ammo,special="",pellet=1,spreadDeg=0){Object.assign(this,{name,color,dmg,cooldown:cd,speed,recoil,ammo,special,pellet,spreadDeg})}}
 const GUNS=[
   new GunDef("Pistol","#3FA7D6",18,.25,1000,0,18),
-  new GunDef("SMG","#2BB673",9,.09,950,0,32,"burst3",1,5),
-  new GunDef("Shotgun","#9C27B0",24,.55,820,0,16,"spread",7,10),   // 3배 데미지, 탄창↑
-  new GunDef("Rifle","#00ADB5",22,.22,1150,0,28),                   // 연사↑(0.28→0.22), 탄창↑
+  new GunDef("SMG","#2BB673",9,.09,950,0,60,"burst3",1,5),
+  new GunDef("Shotgun","#9C27B0",40,.55,820,0,20,"spread",7,13),   // 3배 데미지, 탄창↑
+  new GunDef("Rifle","#00ADB5",22,.1,1700,0,20),                   // 연사↑(0.28→0.22), 탄창↑
   new GunDef("Sniper","#FF8F6B",50,.85,1700,0,6,"sniper"),          // 약한 유도는 탄 생성 시 부여
   new GunDef("Rocket","#FD5E53",55,.95,720,0,7,"rocket"),           // +2 탄창
   new GunDef("Laser",PAL.LASER,70,.95,0,0,3,"beam"),                // 탄창 3

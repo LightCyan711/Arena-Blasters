@@ -1113,66 +1113,264 @@ class GameEnv(gym.Env):
         if self.render_mode == "human":
             self._game.render()
         return obs, info
-
+    
     def step(self, action: int):
+    # ===== fixed-step sim =====
         self._step_count += 1
         dt = 1.0 / FPS
 
-        inputs = self._action_to_inputs(int(action))
+        # ---- persistent scratch (across steps) ----
+        if not hasattr(self, "_prev"):
+            self._prev = {
+                "gun_dist": None,
+                "eng_dev": None,
+                "aim_dot": 0.0,
+                "threat_dist": None,
+            }
 
-        # Save pre-step stats for reward
-        you = self._game.players[0]; bot = self._game.players[1]
-        you_hp_prev, bot_hp_prev = you.hp, bot.hp
+        # ---- helpers ----
+        def has_los(ax, ay, bx, by) -> bool:
+            level = self._game.active_level_rects()
+            dx, dy = bx - ax, by - ay
+            L = max(1.0, math.hypot(dx, dy))
+            steps = int(L / 12.0) + 1
+            for i in range(1, steps):
+                t = i / steps
+                px, py = ax + dx * t, ay + dy * t
+                for r, ttype in level:
+                    if ttype != TILE_SOLID:
+                        continue
+                    if r.left <= px <= r.right and r.top <= py <= r.bottom:
+                        return False
+            return True
+
+        def nearest_gun(player):
+            best, bd2 = None, 1e18
+            for g in self._game.guns:
+                if g.state != "ground":
+                    continue
+                dx, dy = g.x - player.x, g.y - (player.y - player.h)
+                d2 = dx*dx + dy*dy
+                if d2 < bd2:
+                    bd2, best = d2, g
+            return best, (math.sqrt(bd2) if best else 9e9)
+
+        def nearest_threat_bullet(player):
+            cx, cy = player.x, player.y - player.h*0.5
+            best, bd2 = None, 1e18
+            for b in self._game.bullets:
+                if b.owner is player:
+                    continue
+                dx, dy = b.x - cx, b.y - cy
+                d2 = dx*dx + dy*dy
+                if d2 < bd2:
+                    bd2, best = d2, b
+            if best is None:
+                return None, 9e9, False
+            d = math.sqrt(bd2)
+            to_me_x, to_me_y = cx - best.x, cy - best.y
+            L = max(1e-6, math.hypot(to_me_x, to_me_y))
+            approaching = (best.vx * (to_me_x / L) + best.vy * (to_me_y / L) > 0.0)
+            return best, d, (approaching and d < 300.0)
+
+        def aim_alignment(aim_xy, you_xy, tar_xy) -> float:
+            ax, ay = aim_xy[0] - you_xy[0], aim_xy[1] - you_xy[1]
+            tx, ty = tar_xy[0] - you_xy[0], tar_xy[1] - you_xy[1]
+            aL = max(1e-6, math.hypot(ax, ay))
+            tL = max(1e-6, math.hypot(tx, ty))
+            return (ax / aL) * (tx / tL) + (ay / aL) * (ty / tL)  # -1..1
+
+        def weapon_engagement_ring(holding) -> tuple:
+            # 무기별 권장 교전 거리 (NEAR, FAR)
+            if holding is None:
+                return (260.0, 520.0)
+            name = holding.gdef.name
+            if name == "Shotgun":
+                return (140.0, 300.0)
+            if name == "SMG":
+                return (200.0, 420.0)
+            if name == "Pistol":
+                return (220.0, 480.0)
+            if name == "Rifle":
+                return (260.0, 540.0)
+            if name == "Sniper":
+                return (380.0, 900.0)
+            if name == "Rocket":
+                return (240.0, 520.0)
+            if name == "Laser":
+                return (260.0, 560.0)
+            return (260.0, 520.0)
+
+        # ---- pre-snapshot ----
+        you = self._game.players[0]
+        bot  = self._game.players[1]
+
+        you_hp_prev, bot_hp_prev   = you.hp, bot.hp
         you_kos_prev, bot_kos_prev = you.kos, bot.kos
 
-        # Advance game with RL override for YOU
+        you_cx_pre, you_cy_pre = you.x, you.y - you.h*0.6
+        bot_cx_pre,  bot_cy_pre  = bot.x, bot.y - bot.h*0.6
+        dist_pre = math.hypot(bot_cx_pre - you_cx_pre, bot_cy_pre - you_cy_pre)
+
+        aim_pre = np.array(self._aim, dtype=np.float32)
+        aim_dot_pre = aim_alignment(aim_pre, (you_cx_pre, you_cy_pre), (bot_cx_pre, bot_cy_pre))
+        los_pre = has_los(you_cx_pre, you_cy_pre, bot_cx_pre, bot_cy_pre)
+
+        gun_ent_pre, gun_dist_pre = nearest_gun(you)
+        threat_b_pre, threat_dist_pre, threat_flag_pre = nearest_threat_bullet(you)
+
+        has_gun_pre = you.holding is not None
+        ammo_pre = (you.holding.ammo if you.holding else 0)
+        beam_pre = bool(has_gun_pre and getattr(you.holding.gdef, "special", "") == "beam")
+        unarmed_like_pre = (not has_gun_pre) or (ammo_pre <= 0 and not beam_pre)
+
+        NEAR_pre, FAR_pre = weapon_engagement_ring(you.holding)
+        dev_pre = 0.0 if NEAR_pre <= dist_pre <= FAR_pre else (NEAR_pre - dist_pre if dist_pre < NEAR_pre else dist_pre - FAR_pre)
+
+        self._prev["gun_dist"] = gun_dist_pre
+        self._prev["eng_dev"]  = dev_pre
+        self._prev["aim_dot"]  = aim_dot_pre
+        self._prev["threat_dist"] = threat_dist_pre
+
+        # ---- build inputs from action ----
+        inputs = self._action_to_inputs(int(action))
+        fired_this_step = int(action) in (6, 12, 13, 14, 15)
+
+        # ---- advance world ----
         self._game.update(dt, override_inputs_first=inputs)
 
-        # Reward components
-        dmg_dealt = max(0, bot_hp_prev - self._game.players[1].hp)
-        dmg_taken = max(0, you_hp_prev - self._game.players[0].hp)
-        kos_delta_you = self._game.players[0].kos - you_kos_prev
-        kos_delta_bot = self._game.players[1].kos - bot_kos_prev
+        # ---- post-snapshot ----
+        you = self._game.players[0]
+        bot  = self._game.players[1]
 
-        # Base reward: damage/KO 중심
-        reward = (
-            0.10 * dmg_dealt
-            - 0.08 * dmg_taken
-            + 1.0 * kos_delta_you
-            - 1.0 * kos_delta_bot
-        )
+        you_cx, you_cy = you.x, you.y - you.h*0.6
+        bot_cx,  bot_cy  = bot.x, bot.y - bot.h*0.6
+        dist = math.hypot(bot_cx - you_cx, bot_cy - you_cy)
+        los  = has_los(you_cx, you_cy, bot_cx, bot_cy)
 
-        # Activity reward (아주 작게, 초당 최대 +0.01 정도)
-        speed = abs(self._game.players[0].vx) + 0.2 * abs(self._game.players[0].vy)
-        speed_norm = min(1.0, speed / 1000.0)   # ~0..1
-        reward += 0.01 * speed_norm * dt
+        aim_now = np.array(self._aim, dtype=np.float32)
+        aim_dot = aim_alignment(aim_now, (you_cx, you_cy), (bot_cx, bot_cy))
 
-        # Time penalty (초당 -0.01)
-        reward -= 0.01 * dt
+        gun_ent, gun_dist = nearest_gun(you)
+        threat_b, threat_dist, threat_flag = nearest_threat_bullet(you)
 
-        # 겹침/스턱 패널티를 초당으로
-        if self._game.stuck_timer > 0.5:
-            reward -= 0.05 * dt
+        has_gun = you.holding is not None
+        ammo = (you.holding.ammo if you.holding else 0)
+        beam = bool(has_gun and getattr(you.holding.gdef, "special", "") == "beam")
+        unarmed_like = (not has_gun) or (ammo <= 0 and not beam)
 
+        # ---- outcomes ----
+        dmg_dealt = max(0, bot_hp_prev - bot.hp)
+        dmg_taken = max(0, you_hp_prev - you.hp)
+        kos_you   = you.kos - you_kos_prev
+        kos_bot   = bot.kos - bot_kos_prev
+
+        # ===== base reward: kill/hit/survive (dominates) =====
+        reward  = 0.30 * float(dmg_dealt)
+        reward -= 0.25 * float(dmg_taken)
+        reward += 20.0 * float(kos_you)
+        reward -= 20.0 * float(kos_bot)
+
+        # ===== weapon handling =====
+        if unarmed_like_pre or unarmed_like:
+            # 진짜 진행(reward for distance reduction to nearest gun)
+            if self._prev["gun_dist"] is not None and math.isfinite(self._prev["gun_dist"]) and math.isfinite(gun_dist):
+                prog = float(self._prev["gun_dist"] - gun_dist)      # >0 가까워짐
+                reward += 0.006 * prog                                # ~+0.06/10px
+            # 가만히 있지 않게 약한 압박
+            speed = abs(you.vx) + 0.2 * abs(you.vy)
+            if speed < 140.0:
+                reward -= 0.008 * dt
+            # 줍기 성공 보너스
+            if unarmed_like_pre and (not unarmed_like):
+                reward += 2.0
+
+        # ===== engagement shaping (armed-like) =====
+        NEAR, FAR = weapon_engagement_ring(you.holding if has_gun else None)
+        dev = 0.0 if NEAR <= dist <= FAR else (NEAR - dist if dist < NEAR else dist - FAR)
+        if not unarmed_like:
+            # 링 안: 소폭 유지 보상
+            if NEAR <= dist <= FAR:
+                reward += 0.025 * dt
+            # 링에 접근하는 상대적 개선 보상
+            if self._prev["eng_dev"] is not None:
+                reward += 0.006 * float(self._prev["eng_dev"] - dev)
+            # 계속 크게 벗어나면 미세 패널티
+            reward -= 0.003 * dt * float(min(1.0, abs(dev) / 700.0))
+
+            # LOS & 조준 정합
+            if los:
+                reward += 0.02 * max(0.0, aim_dot) * dt
+            else:
+                # 위협 상황에서 엄폐(LOS 꺼짐)면 소폭 보상
+                if threat_flag or (self._prev["threat_dist"] is not None and self._prev["threat_dist"] < 220.0):
+                    reward += 0.005 * dt
+                else:
+                    reward -= 0.003 * dt
+
+            # 발사 유인: 맞출 수 있을 때만 강하게
+            if fired_this_step and has_gun:
+                if los and aim_dot > 0.70:
+                    reward += 0.18
+                elif aim_dot < 0.40:
+                    reward -= 0.03  # 허공 난사 억제
+
+                # 탄약 관리: 탄 적을 때는 정합 높을 때만 쏘게 유도
+                if ammo <= max(3, int((you.holding.gdef.ammo or 6) * 0.2)) and aim_dot < 0.85:
+                    reward -= 0.02
+
+            # 조준 향상 자체에 대한 짧은 보상
+            if self._prev["aim_dot"] is not None:
+                delta_aim = max(0.0, float(aim_dot - self._prev["aim_dot"]))
+                reward += min(0.08, 0.12 * delta_aim)
+
+        # ===== threat avoidance (armed/unarmed 공통) =====
+        if threat_flag:
+            reward -= 0.04 * dt  # 탄이 접근 중이면 압박
+        if (self._prev["threat_dist"] is not None
+            and math.isfinite(self._prev["threat_dist"])
+            and math.isfinite(threat_dist)
+            and self._prev["threat_dist"] < 350.0):
+            # 위협으로부터 멀어졌으면 보상
+            reward += 0.006 * float(threat_dist - self._prev["threat_dist"])
+            # 근접 회피 성공(near-miss)
+            if self._prev["threat_dist"] < 140.0 and threat_dist > 200.0 and dmg_taken == 0:
+                reward += 0.10
+
+        # ===== environment mild penalties =====
+        if you.x < 70.0 or you.x > WORLD_W - 70.0:
+            reward -= 0.008 * dt
+        if self._game.stuck_timer > 0.6:
+            reward -= 0.02 * dt
+
+        # faint time pressure
+        reward -= 0.0002 * dt
+
+        # ---- termination / truncation ----
         terminated = False
-        truncated = False
+        truncated = (self._step_count >= self.max_steps) or (self._game.time_left <= 0.0)
 
-        # Episode ends on time or many steps
-        if self._step_count >= self.max_steps or self._game.time_left <= 0.0:
-            truncated = True
-
+        # ---- obs & info ----
         obs = self._get_obs()
         info = {
-            "dmg_dealt": dmg_dealt,
-            "dmg_taken": dmg_taken,
-            "you_kos": self._game.players[0].kos,
-            "bot_kos": self._game.players[1].kos,
+            "dmg_dealt": float(dmg_dealt),
+            "dmg_taken": float(dmg_taken),
+            "you_kos":   int(you.kos),
+            "bot_kos":   int(bot.kos),
+            "dist":      float(dist),
+            "los":       bool(los),
+            "aim_dot":   float(aim_dot),
+            "has_gun":   bool(has_gun),
+            "ammo":      int(ammo),
+            "gun_dist":  float(gun_dist),
         }
 
         if self.render_mode == "human":
             self._game.render()
 
         return obs, float(reward), terminated, truncated, info
+
+
 
     def render(self):
         frame = self._game.render()
