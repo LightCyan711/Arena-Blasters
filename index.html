@@ -163,6 +163,9 @@ let gameMode = null;
 
 let peer=null, connMap=new Map();
 let isHost=true, roomCode=null, myNick="YOU";
+
+let myId = null;
+let myInput = {};
 const MAX_PLAYERS=4;
 
 const Keys=new Map();
@@ -1031,25 +1034,86 @@ function finishMatch(){
 /* =========================
    MULTI (chat only)
 ========================= */
-function setupPeer(){
-  try{
-    peer = new Peer(`AB-${roomCode}`, { debug: 1 });
-    peer.on('open', id=>{ if(isHost){ roomInfo.textContent=`코드 ${roomCode}`; show(btnCopy); } });
-    peer.on('connection', conn=>{
-      connMap.set(conn.peer, conn); updatePlayerCount();
-      conn.on('data', msg=>{ if(msg.type==='chat') pushChat(msg.payload); });
-      conn.on('close', ()=>{ connMap.delete(conn.peer); updatePlayerCount(); });
-    });
-    if(!isHost){
-      const conn=peer.connect(`AB-${roomCode}`);
-      conn.on('open', ()=>{ connMap.set('host',conn); updatePlayerCount(); });
-      conn.on('data', msg=>{ if(msg.type==='chat') pushChat(msg.payload); });
-      conn.on('close', ()=>{ connMap.delete('host'); updatePlayerCount(); });
+function broadcast(type, payload) {
+  if (isHost) {
+    // 호스트 → 모든 참가자
+    for (const conn of connMap.values()) {
+      if (conn.open) conn.send({ type, payload });
     }
-  }catch(e){ console.warn('PeerJS error', e); }
+  } else {
+    // 참여자 → 호스트
+    const conn = connMap.get("host");
+    if (conn && conn.open) conn.send({ type, payload });
+  }
 }
-function updatePlayerCount(){ playerCount.textContent=`${1+connMap.size}/${MAX_PLAYERS}`; }
-function broadcast(type,payload){ for(const conn of connMap.values()){ try{ conn.send({type,payload}); }catch(e){} } }
+
+function setupPeer() {
+  const peerId = isHost
+    ? `AB-${roomCode}-host`
+    : `AB-${roomCode}-${Math.floor(Math.random()*1e6)}`;
+
+  peer = new Peer(peerId, { host: "0.peerjs.com", port: 443, path: "/", secure: true });
+
+  peer.on("open", id => {
+  myId = id;   // 🔹 여기서 내 아이디를 기록
+  console.log("PeerJS open:", id);
+  if (isHost) {
+    roomInfo.textContent = `코드 ${roomCode}`;
+    show(btnCopy);
+  }
+});
+
+  peer.on("error", err => {
+    console.error("PeerJS error", err);
+    toast("네트워크 오류", false, true);
+  });
+
+  if (isHost) {
+    // 호스트가 연결 받음
+    peer.on("connection", conn => {
+      connMap.set(conn.peer, conn);
+      updatePlayerCount();
+
+      // 새로운 플레이어 등록
+      GAME.players.push(new Player(conn.peer, 200, 200, "blue", "Guest"));
+
+      conn.on("data", msg => {
+        if (msg.type === "chat") pushChat(msg.payload);
+        if (msg.type === "input") {
+          // 플레이어 입력 업데이트
+          const p = GAME.players.find(pl => pl.id === msg.payload.id);
+          if (p) p.input = msg.payload.input;
+        }
+      });
+
+      conn.on("close", () => {
+        connMap.delete(conn.peer);
+        GAME.players = GAME.players.filter(p => p.id !== conn.peer);
+        updatePlayerCount();
+      });
+    });
+  } else {
+    // 참여자 → 호스트 연결
+    const hostId = `AB-${roomCode}-host`;
+    const conn = peer.connect(hostId);
+    conn.on("open", () => {
+      connMap.set("host", conn);
+      updatePlayerCount();
+      console.log("Connected to host:", hostId);
+    });
+    conn.on("data", msg => {
+      if (msg.type === "chat") pushChat(msg.payload);
+      if (msg.type === "state") {
+        // 호스트 게임 상태를 덮어쓰기
+        Object.assign(GAME, msg.payload);
+      }
+    });
+    conn.on("close", () => {
+      connMap.delete("host");
+      updatePlayerCount();
+    });
+  }
+}
 
 /* =========================
    MAIN LOOP
@@ -1060,45 +1124,25 @@ function loop(now){
   while(acc>=FIXED_DT){ step(FIXED_DT); acc-=FIXED_DT; }
   render(); requestAnimationFrame(loop);
 }
-function step(dt){
-  // mouse edge calc
-  mouse.edgeR = mouse.rmb && !mouse.prevR;
-  mouse.prevR = mouse.rmb; mouse.prevL = mouse.lmb;
+function step(dt) {
+  if (isHost) {
+    // 호스트는 게임 전체 시뮬레이션
+    for (const p of GAME.players) {
+      const inp = (p === GAME.players[0]) ? getInputsForPlayer(p) : p.input;
+      p.update(dt, inp, GAME.level, GAME.bullets, GAME.guns, GAME.players, GAME.particles, GAME.beams, GAME.winds, GAME.tps, {weaponsEnabled:GAME.fightLive});
+    }
+    for (const b of GAME.bullets) b.update(dt);
 
-  if(screen!==SCREENS.LOBBY && screen!==SCREENS.GAME) return;
-
-  if(screen===SCREENS.GAME && GAME.fightLive){
-    GAME.timeLeft -= dt; if(GAME.timeLeft<=0){ GAME.timeLeft=0; finishMatch(); return; }
+    // 상태 브로드캐스트 ...
+  } else {
+    // 참여자 → 입력 업데이트 후 전송
+    myInput = getInputsForPlayer(GAME.players[0]);
+    broadcast("input", { id: myId, input: myInput });
   }
-
-  if(screen===SCREENS.GAME){
-    spawnTimer-=dt; if(spawnTimer<=0){ if(GAME.guns.length<MAX_GUNS){ spawnGun(); spawnInterval=Math.max(SPAWN_MIN, spawnInterval*0.96); } spawnTimer=spawnInterval; }
-  }
-
-  for(const p of GAME.players){
-    let base=getInputsForPlayer(p);
-    if(p.isBot && GAME.players.length>=2){
-      const enemy=GAME.players.find(q=>q!==p)||p;
-      aiStepIfNeeded(performance.now(), p, enemy, screen===SCREENS.LOBBY).then(intent=>{ p.input=mergeInputs(base, intent); });
-    } else { p.input=base; }
-  }
-
-  const rules={ weaponsEnabled: (screen===SCREENS.GAME) && GAME.fightLive };
-  const levelNow=GAME.level;
-  const winds = (screen===SCREENS.GAME) ? GAME.winds : [];     // 로비에서는 없음
-  const tps   = (screen===SCREENS.GAME) ? GAME.tps   : [];
-  for(const p of GAME.players){
-    p.update(dt, p.input, levelNow, GAME.bullets, GAME.guns, GAME.players, GAME.particles, GAME.beams, winds, tps, rules);
-    if(!p.alive){ p.respawn({x:WORLD_W*.5, y:WORLD_H*.2}); if(rules.weaponsEnabled) giveRandomWeapon(p); }
-  }
-  for(let i=GAME.guns.length-1;i>=0;i--){ const g=GAME.guns[i]; const alive=g.update(dt, levelNow); if(!alive && !g.spawned_pickup) GAME.guns.splice(i,1); }
-  for(let i=GAME.bullets.length-1;i>=0;i--){ const b=GAME.bullets[i]; const alive=b.update(dt, levelNow, GAME.players, GAME.particles, [], GAME.fightLive); if(!alive) GAME.bullets.splice(i,1); }
-  for(let i=GAME.beams.length-1;i>=0;i--){ const bm=GAME.beams[i]; const alive=bm.update(dt, GAME.players, GAME.particles, [], GAME.fightLive); if(!alive) GAME.beams.splice(i,1); }
-  GAME.particles = GAME.particles.filter(p=>p.update(dt));
-
-  const you=GAME.players[0]; if(you){ const tx=you.x - RW/2, ty=you.y - RH/2; GAME.cam.x = clamp(lerp(GAME.cam.x, tx, .15), 0, WORLD_W-RW); GAME.cam.y = clamp(lerp(GAME.cam.y, ty, .15), 0, WORLD_H-RH); }
-  updateHUD();
 }
+
+
+
 function render(){
   ctx.save(); ctx.clearRect(0,0,cv.width,cv.height); ctx.fillStyle=PAL.BG; ctx.fillRect(0,0,cv.width,cv.height);
   if(screen===SCREENS.LOBBY || screen===SCREENS.GAME){
